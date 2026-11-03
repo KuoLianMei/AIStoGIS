@@ -1,0 +1,172 @@
+# -*- coding: utf-8 -*-
+"""Run inside QGIS 3 Python Editor. CSV -> WGS84 / TWD97 GEO / TWD97 TM2 SHP."""
+'''
+QGIS External Python Script Execution Command
+exec(compile(open(r"C:\Users\Students\Downloads\CSVtoSHP.py", encoding="utf-8").read(), r"C:\Users\Students\Downloads\CSVtoSHP.py", "exec"))
+
+整批CSV直接匯入QGIS為SHP圖層
+請於python console內 執行QGIS External Python Script Execution Command
+張耘馨
+20261103
+'''
+import csv
+import os
+from pathlib import Path
+from qgis.core import (
+    QgsProject, QgsVectorLayer, QgsVectorFileWriter, QgsCoordinateReferenceSystem,
+    QgsCoordinateTransform, QgsField, QgsFeature, QgsGeometry, QgsPointXY,
+)
+from qgis.PyQt.QtCore import QVariant
+from qgis.PyQt.QtWidgets import QFileDialog
+
+SOURCE_EPSG = 'EPSG:4326'  # This assumes lon/lat are WGS84 degrees.
+OUTPUTS = {'WGS84': 'EPSG:4326', 'TWD97_GEO': 'EPSG:3824', 'TWD97_TM2': 'EPSG:3826'}
+X_NAMES = {'lon', 'longitude', 'long', 'x', '經度'}
+Y_NAMES = {'lat', 'latitude', 'y', '緯度'}
+BATCH_SIZE = 2000
+
+project = QgsProject.instance()
+folder = QFileDialog.getExistingDirectory(None, '選擇 AIS CSV 資料夾', '')
+if not folder:
+    raise RuntimeError('未選擇 CSV 資料夾')
+output_dir = Path(folder) / 'SHP_Output'
+for key in OUTPUTS:
+    (output_dir / key).mkdir(parents=True, exist_ok=True)
+
+
+def csv_format(path):
+    raw = path.read_bytes()[:65536]
+    for codec in ('utf-8-sig', 'utf-8', 'cp950', 'big5'):
+        try:
+            sample = raw.decode(codec)
+        except UnicodeDecodeError:
+            continue
+        try:
+            sep = csv.Sniffer().sniff(sample, delimiters=',;\t').delimiter
+        except csv.Error:
+            sep = ','
+        return codec, sep
+    raise ValueError('無法確認文字編碼：' + path.name)
+
+
+def make_layer(path):
+    codec, sep = csv_format(path)
+    layer = QgsVectorLayer('Point?crs=' + SOURCE_EPSG, path.stem + '_WGS84_source', 'memory')
+    if not layer.isValid():
+        raise RuntimeError('無法建立 QGIS 記憶體點圖層')
+    provider = layer.dataProvider()
+    valid_count = 0
+    invalid_count = 0
+    mismatched = 0
+    with path.open('r', encoding=codec, newline='') as f:
+        reader = csv.reader(f, delimiter=sep)
+        original_headers = next(reader)
+        headers = [h.lstrip('\ufeff').strip() for h in original_headers]
+        normalized = [h.casefold() for h in headers]
+        x_idx = next((i for i, h in enumerate(normalized) if h in X_NAMES), None)
+        y_idx = next((i for i, h in enumerate(normalized) if h in Y_NAMES), None)
+        if x_idx is None or y_idx is None:
+            raise ValueError('找不到 lon / lat，欄位：' + str(headers))
+        # Preserve all source values as text, especially MMSI identifiers.
+        # Shapefile limits field names to 10 bytes; GDAL will launder long names.
+        provider.addAttributes([QgsField(h or ('field_' + str(i)), QVariant.String)
+                                for i, h in enumerate(headers)])
+        layer.updateFields()
+        batch = []
+        for line_no, row in enumerate(reader, start=2):
+            if len(row) != len(headers):
+                mismatched += 1
+                # Extra fields or short rows can indicate malformed CSV.
+                # Skip to avoid silently shifting attributes.
+                continue
+            try:
+                lon = float(row[x_idx].strip())
+                lat = float(row[y_idx].strip())
+                if not (-180 <= lon <= 180 and -90 <= lat <= 90):
+                    raise ValueError('coordinate out of range')
+            except (ValueError, IndexError):
+                invalid_count += 1
+                continue
+            feat = QgsFeature(layer.fields())
+            feat.setGeometry(QgsGeometry.fromPointXY(QgsPointXY(lon, lat)))
+            feat.setAttributes(row)
+            batch.append(feat)
+            if len(batch) >= BATCH_SIZE:
+                ok, _ = provider.addFeatures(batch)
+                if not ok:
+                    raise RuntimeError('寫入 QGIS 記憶體圖層失敗')
+                valid_count += len(batch)
+                batch.clear()
+        if batch:
+            ok, _ = provider.addFeatures(batch)
+            if not ok:
+                raise RuntimeError('寫入 QGIS 記憶體圖層失敗')
+            valid_count += len(batch)
+    layer.updateExtents()
+    print('編碼：{}；分隔：{}；經度：{}；緯度：{}'.format(codec, repr(sep), headers[x_idx], headers[y_idx]))
+    print('有效點：{}；無效座標：{}；欄位數不符：{}'.format(valid_count, invalid_count, mismatched))
+    if not valid_count:
+        raise RuntimeError('沒有有效座標資料；請檢查 CSV 原始內容')
+    return layer
+
+
+def save_shp(source, path, epsg):
+    target = QgsCoordinateReferenceSystem(epsg)
+    if not target.isValid():
+        raise RuntimeError('無效的目標 CRS：' + epsg)
+    options = QgsVectorFileWriter.SaveVectorOptions()
+    options.driverName = 'ESRI Shapefile'
+    options.fileEncoding = 'UTF-8'
+    options.actionOnExistingFile = QgsVectorFileWriter.CreateOrOverwriteFile
+    if source.crs() != target:
+        transform = QgsCoordinateTransform(source.crs(), target, project)
+        if not transform.isValid():
+            raise RuntimeError('無效座標轉換：' + epsg)
+        options.ct = transform
+    result = QgsVectorFileWriter.writeAsVectorFormatV3(
+        source, str(path), project.transformContext(), options)
+    if result[0] != QgsVectorFileWriter.NoError:
+        raise RuntimeError('SHP 輸出失敗：' + str(result))
+    shp = QgsVectorLayer(str(path), path.stem, 'ogr')
+    if not shp.isValid():
+        raise RuntimeError('SHP 寫入後無法重新開啟：' + str(path))
+    prj = path.with_suffix('.prj')
+    actual = shp.crs()
+    print('  {}：SHP={}、PRJ={}、讀取CRS={}、有效={}、筆數={}'.format(
+        epsg, path.exists(), prj.exists(), actual.authid(), actual.isValid(), shp.featureCount()))
+    if not prj.exists() or not actual.isValid():
+        raise RuntimeError('缺少 PRJ 或輸出 CRS 無效；未視為驗證成功')
+    if actual != target:
+        # ESRI WKT and EPSG WKT are not always recognized as identical.
+        # Do not relabel or claim equivalence automatically.
+        raise RuntimeError('輸出 CRS 與目標定義不一致；請檢查 .prj 與 QGIS CRS 詳細資訊')
+    if shp.featureCount() != source.featureCount():
+        raise RuntimeError('輸出筆數與來源不一致')
+    project.addMapLayer(shp)
+    return shp
+
+files = sorted(p for p in Path(folder).iterdir() if p.is_file() and p.suffix.lower() == '.csv')
+complete = 0
+incomplete = 0
+for path in files:
+    print('\n========== {} =========='.format(path.name))
+    try:
+        source = make_layer(path)
+        successes = 0
+        for label, epsg in OUTPUTS.items():
+            target_path = output_dir / label / (path.stem + '_' + label + '.shp')
+            try:
+                save_shp(source, target_path, epsg)
+                successes += 1
+            except Exception as exc:
+                print('  {} 失敗：{}'.format(label, exc))
+        if successes == len(OUTPUTS):
+            complete += 1
+        else:
+            incomplete += 1
+    except Exception as exc:
+        incomplete += 1
+        print('CSV 處理失敗：', exc)
+print('\n總 CSV：{}；全部成功：{}；部分或全部失敗：{}'.format(len(files), complete, incomplete))
+print('輸出目錄：', output_dir)
+iface.mapCanvas().refresh()
